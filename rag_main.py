@@ -4,6 +4,14 @@ import dspy
 from langchain_chroma import Chroma
 from langchain_openai import OpenAIEmbeddings
 from tools import search_web
+import logging
+
+#configure logging
+logging.basicConfig(
+    level=logging.INFO, 
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
 
 # Load variables from .env into environment
 load_dotenv()
@@ -26,22 +34,29 @@ db = Chroma(
     embedding_function=embeddings
 )
 
-#query the vector store
-question = "What is nanobrowser"
 retriever = db.as_retriever()
 
 #for storing past chat history
 chat_history=[]
 
+#-------------------------------------------------------
+
 #define tools for ReAct 
 def search_vector_db(query:str)->str:
     """
     Search the local vector database for relevant information,
-    Use this for questionsabout documents in the knowledge base.
+    Use this for questions about documents in the knowledge base.
     """
+    logging.info(f"Searching vector database for: {query}")
+
     docs=retriever.invoke(query)
     if docs:
-        return "\n\n".join([doc.page_content for doc in docs[:3]])
+        contents= "\n\n".join([doc.page_content for doc in docs[:3]])
+        logging.info(f"Retrieved {len(docs)} documents from vector DB")
+        logging.debug(f"Top content: {contents[:200]}...")
+        return contents
+
+    logging.warning("No relevant information found in the vector database.")
     return "No relevant information found in the vector database."
 
 # #Takes a user’s question → search for relevant text chunks → return their text content.
@@ -71,6 +86,7 @@ class RAGWithReAct(dspy.Module):
         if history_context:
             enhanced_question = f"{history_context}\nCurrent question: {question}"
         
+        logging.info(f"Processing question: {question}")
         self.react.set_lm(lm=dspy.LM("openai/gpt-4.1", temperature=0.7))
         # Let ReAct decide which tools to use
         response = self.react(question=enhanced_question)
@@ -80,7 +96,7 @@ class RAGWithReAct(dspy.Module):
             "question": question,
             "response": response
         })
-        
+        logging.info(f"Response: {response.answer[:120]}")
         return response
 
 if __name__ == "__main__":
