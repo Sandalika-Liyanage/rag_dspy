@@ -5,6 +5,7 @@ from langchain_chroma import Chroma
 from langchain_openai import OpenAIEmbeddings
 from tools import search_web
 import logging
+from db_utils import create_chat_table, save_chat, get_recent_history
 
 #configure logging
 logging.basicConfig(
@@ -36,8 +37,8 @@ db = Chroma(
 
 retriever = db.as_retriever()
 
-#for storing past chat history
-chat_history=[]
+#create chat history table
+create_chat_table()
 
 #-------------------------------------------------------
 
@@ -70,16 +71,19 @@ class RAGWithReAct(dspy.Module):
         self.react = dspy.ReAct(
             signature="question->answer",
             tools=[search_vector_db, search_web],
-            max_iters=1 #max reasoning iterations
+            max_iters=3 #max reasoning iterations
         )
         
     def forward(self, question):
+        # Get recent chat history from database
+        history = get_recent_history(limit=3)
+
         # Build context from chat history
         history_context = ""
-        if chat_history:
+        if history:
             history_context = "Previous conversation:\n"
-            for entry in chat_history[-3:]:  # Last 3 exchanges
-                history_context += f"Q: {entry['question']}\nA: {entry['response'].answer}\n"
+            for entry in history:
+                history_context += f"Q: {entry['question']}\nA: {entry['answer']}\n"
         
         # Enhance question with history if available
         enhanced_question = question
@@ -91,11 +95,8 @@ class RAGWithReAct(dspy.Module):
         # Let ReAct decide which tools to use
         response = self.react(question=enhanced_question)
         
-        # Store in chat history
-        chat_history.append({
-            "question": question,
-            "response": response
-        })
+        # Save to database
+        save_chat(question, response.answer)
         logging.info(f"Response: {response.answer[:120]}")
         return response
 
@@ -117,7 +118,4 @@ if __name__ == "__main__":
         print(f"Answer: {output.answer}")
         
         # Show the reasoning trace
-        if hasattr(output, 'trajectories'):
-            print(f"\nReasoning Trace:")
-            for i, step in enumerate(output.trajectories, 1):
-                print(f"  Step {i}: {step}")
+    dspy.inspect_history(n=1)
