@@ -35,14 +35,17 @@ db = Chroma(
     embedding_function=embeddings
 )
 
-retriever = db.as_retriever()
+retriever = db.as_retriever(
+    search_type="similarity",
+    search_kwargs={'k': 3}  # top 3 docs
+)
 
 #create chat history table
 create_chat_table()
 
 #-------------------------------------------------------
 
-#define tools for ReAct 
+#define tools for decisionagent
 def search_vector_db(query:str)->str:
     """
     Search the local vector database for relevant information,
@@ -53,7 +56,7 @@ def search_vector_db(query:str)->str:
     docs=retriever.invoke(query)
     if docs:
         contents= "\n\n".join([doc.page_content for doc in docs[:3]])
-        logging.info(f"Retrieved {len(docs)} documents from vector DB")
+        logging.info(f"Retrieved {len(docs)} documents above score threshold")
         logging.debug(f"Top content: {contents[:200]}...")
         return contents
 
@@ -69,8 +72,8 @@ class ToolDecision(dspy.Signature):
     tool to use and the specific query for that tool."""
 
     question=dspy.InputField()
-    history_context = dspy.InputField(desc="Previous conversation history to maintain context.")
-    available_tools = dspy.InputField(desc="Available tools: search_vector_db (for internal knowledge), search_web (for current or public information).")
+    history_context = dspy.InputField(desc="Previous conversation history to follow up the questions.")
+    available_tools = dspy.InputField(desc="Available tools: search_vector_db (for internal, domain-specific knowledge), search_web (for current or public information).")
 
     tool_choice = dspy.OutputField(desc="The name of the tool to be called (search_vector_db or search_web).")
     tool_query = dspy.OutputField(desc="The precise search query string to pass to the chosen tool. Max 10 words.")
@@ -83,6 +86,7 @@ class FinalAnswer(dspy.Signature):
     agent_reasoning = dspy.InputField(desc="The Decision Agent's rationale for the tool used.")
     answer = dspy.OutputField()
 
+#------------------------------------------------------
 
 class DecisionAgent(dspy.Module):
     def __init__(self):
@@ -97,6 +101,9 @@ class DecisionAgent(dspy.Module):
         )
         return response
 
+MAX_ATTEMPTS = 2
+FAILURE_MESSAGE = "No relevant information found in the vector database."
+
 class RAGWithDecisionAgent(dspy.Module):
     def __init__(self, tools):
         super().__init__()
@@ -108,40 +115,67 @@ class RAGWithDecisionAgent(dspy.Module):
         logging.info(f"Processing question with Decision Agent pipeline: {question}")
         
         #get chat history
-        history=get_recent_history(limit=3)
-        history_context = ""
-        if history:
+        attempt = 0
+        tool_output = None
+        
+        # start of the loop
+        while attempt < MAX_ATTEMPTS:
+            
+            # 1. Prepare Context (Conversation History + Dynamic Failure Log)
+            history = get_recent_history(limit=3)
             history_context = "Previous conversation:\n" + "\n".join(
                 [f"Q: {entry['question']}\nA: {entry['answer']}" for entry in history]
             )
-        #decision agnet calls (decide strategy)
-        decision = self.decision_agent(question=question, history_context=history_context)
+            
+            # critical : Append failure information to the context for re-planning
+            if attempt > 0 and tool_output == FAILURE_MESSAGE:
+                failed_tool = decision.tool_choice.strip()
+                # Tell the LLM why it's restarting the planning phase
+                failure_note = f"\n[CRITICAL NOTE: Attempt {attempt} with tool '{failed_tool}' failed. You MUST select a different available tool.]"
+                full_context_for_decision = history_context + failure_note
+            else:
+                full_context_for_decision = history_context
 
-        chosen_tool_name = decision.tool_choice.strip()
-        chosen_query = decision.tool_query.strip()
+            # 2. Decision Agent Call (Plan the strategy)
+            decision = self.decision_agent(question=question, history_context=full_context_for_decision)
+            
+            chosen_tool_name = decision.tool_choice.strip()
+            chosen_query = decision.tool_query.strip()
+            logging.info(f"Attempt {attempt + 1} Plan: Tool: {chosen_tool_name}...")
+
+            # 3. Tool Execution
+            if chosen_tool_name in self.tools:
+                tool_func = self.tools[chosen_tool_name]
+                tool_output = tool_func(chosen_query)
+            else:
+                tool_output = f"ERROR: Invalid tool chosen: {chosen_tool_name}."
+
+            # 4. Validation Check
+            if tool_output != FAILURE_MESSAGE and "ERROR" not in tool_output:
+                logging.info("SUCCESS: Relevant information found. Exiting loop.")
+                break # Success Generate final answer.
+
+            # 5. Loop Continuation
+            attempt += 1
+            if attempt >= MAX_ATTEMPTS:
+                logging.warning("MAX ATTEMPTS REACHED. Ending conversation.")
+        #  end of the loop
         
-        logging.info(f"Agent Decision - Tool: {chosen_tool_name}, Query: {chosen_query}, Reasoning: {decision.reasoning}")
-
-        #tool execution
-        tool_output = "No tool was executed."
-        if chosen_tool_name in self.tools:
-            tool_func = self.tools[chosen_tool_name]
-            tool_output = tool_func(chosen_query)
+        # 6. Synthesis (After Loop)
+        if tool_output != FAILURE_MESSAGE and "ERROR" not in tool_output:
+            response = self.final_answer_generator(
+                question=question,
+                tool_output=tool_output,
+                agent_reasoning=decision.reasoning
+            )
+            final_answer = response.answer
         else:
-            tool_output = f"Error: Decision Agent chose an invalid tool: {chosen_tool_name}. No retrieval performed."
+            final_answer = "I apologize, I was unable to find relevant information using the available tools after several attempts."
+            response = dspy.Prediction(answer=final_answer)
 
-        #generate final answer
-        response = self.final_answer_generator(
-            question=question,
-            tool_output=tool_output,
-            agent_reasoning=decision.reasoning
-        )
-
-        #save to chat history
-        save_chat(question,response.answer)
-        logging.info(f"Answer: {response.answer[:120]}...")
-
-        response.decision = decision #for the inspection
+        # 7. Save and Return
+        save_chat(question, final_answer)
+        response.decision = decision
         return response
 
 if __name__ == "__main__":
@@ -152,7 +186,7 @@ if __name__ == "__main__":
     
     # testing questions
     questions = [
-        "What is  QwenLM/Qwen-Agent?",  # Should use vector DB
+        "What is  nanobrowser?",  # Should use vector DB
         "Who is the chess champion recently passed away?",  # Should use web search
         "What country he is from?"  # Should use history
     ]
